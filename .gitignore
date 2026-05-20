@@ -1,0 +1,31 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Database
+*.db
+
+# Generated files
+backend/static/audio/
+backend/static/posters/
+backend/models/*.pkl
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Node
+node_modules/
+dist/
+
+# Cache & Logs
+geocode_cache.json
+*.log
+*.err.log
