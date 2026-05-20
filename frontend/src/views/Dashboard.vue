@@ -515,70 +515,139 @@ export default {
         this.campaigns = data.campaigns || []
       } catch (e) { console.error('Campaigns error:', e) }
     },
-    runPipeline(syngentaMode = false) {
+    async runPipeline(syngentaMode = false) {
       const s = this.store
       s.startRun()
       s.result.mode = syngentaMode ? 'syngenta_real' : 'standard'
-      
-      let url = `${API}/campaign/stream?limit=1000`
-      if (this.selectedState) url += `&state=${encodeURIComponent(this.selectedState)}`
-      if (syngentaMode) url += '&syngenta_only=true'
-      
-      const source = new EventSource(url)
-      s._source = source
-      
-      source.onmessage = (event) => {
-        const msg = JSON.parse(event.data)
-        
-        if (msg.type === 'error') {
-          alert(msg.message)
+
+      const usePolling = import.meta.env.PROD
+        || (import.meta.env.VITE_USE_PIPELINE_POLLING || '').toLowerCase() === 'true'
+
+      if (usePolling) {
+        await this.runPipelinePolling(syngentaMode)
+      } else {
+        this.runPipelineSSE(syngentaMode)
+      }
+    },
+    handlePipelineEvent(msg) {
+      const s = this.store
+      if (msg.type === 'error') {
+        alert(msg.message)
+        return 'error'
+      }
+      if (msg.type === 'init') {
+        s.total = msg.total
+        s.result.season = msg.season
+        s.result.state_filter = msg.state_filter
+        s.result.total_districts = msg.total
+      } else if (msg.type === 'phase') {
+        s.phase = msg.message
+      } else if (msg.type === 'district') {
+        s.progress = msg.progress
+        s.latest = `${msg.data.district}, ${msg.data.state}`
+        s.result.district_health.push(msg.data)
+        if (msg.data.status === 'healthy') s.result.healthy++
+        else if (msg.data.status === 'at_risk') s.result.at_risk++
+        const st = msg.data.state
+        const expandedCount = Object.keys(s.expandedStates).length
+        if (expandedCount < 3 && !s.expandedStates[st]) {
+          s.expandedStates[st] = true
+        }
+      } else if (msg.type === 'campaign_linked') {
+        const match = s.result.district_health.find(
+          h => h.district === msg.district && h.state === msg.state
+        )
+        if (match) match.campaign_id = msg.campaign_id
+      } else if (msg.type === 'complete') {
+        s.result.campaigns_created = msg.summary.campaigns_created
+        const skipped = msg.summary.skipped_unchanged || msg.summary.skipped_cached || 0
+        let label = `✅ Complete — ${msg.summary.total} districts`
+        if (skipped > 0) label += ` (${skipped} unchanged — no duplicates)`
+        s.phase = label
+        return 'complete'
+      }
+      return 'ok'
+    },
+    async runPipelinePolling(syngentaMode) {
+      const s = this.store
+      const body = { limit: 1000, syngenta_only: syngentaMode }
+      if (this.selectedState) body.state = this.selectedState
+
+      try {
+        const { data: start } = await axios.post(`${API}/campaign/start-async`, body)
+        if (start.error) {
+          alert(start.error)
           s.finish()
           return
         }
-        
-        if (msg.type === 'init') {
-          s.total = msg.total
-          s.result.season = msg.season
-          s.result.state_filter = msg.state_filter
-          s.result.total_districts = msg.total
-        }
-        else if (msg.type === 'phase') {
-          s.phase = msg.message
-        }
-        else if (msg.type === 'district') {
-          s.progress = msg.progress
-          s.latest = `${msg.data.district}, ${msg.data.state}`
-          s.result.district_health.push(msg.data)
-          
-          if (msg.data.status === 'healthy') s.result.healthy++
-          else if (msg.data.status === 'at_risk') s.result.at_risk++
-          
-          // Auto-expand first 3 states
-          const st = msg.data.state
-          const expandedCount = Object.keys(s.expandedStates).length
-          if (expandedCount < 3 && !s.expandedStates[st]) {
-            s.expandedStates[st] = true
+
+        const jobId = start.job_id
+        let since = 0
+        const syngenta = syngentaMode
+
+        const poll = async () => {
+          if (!s.running) return
+          try {
+            const { data } = await axios.get(`${API}/campaign/job/${jobId}`, { params: { since } })
+            since = data.next_since
+            for (const msg of data.events || []) {
+              this.handlePipelineEvent(msg)
+            }
+            if (data.status === 'complete' || data.status === 'error') {
+              if (s._pollTimer) {
+                clearInterval(s._pollTimer)
+                s._pollTimer = null
+              }
+              if (data.status === 'complete') {
+                s.finish()
+                this.fetchStats()
+                this.fetchCampaigns()
+                this.loadLastResults(true, syngenta)
+              } else {
+                s.phase = `❌ ${data.error || 'Pipeline failed'}`
+                if (data.error) alert(data.error)
+                s.finish()
+                this.loadLastResults(true, syngenta)
+              }
+            }
+          } catch (e) {
+            console.error(e)
+            s.phase = '❌ Connection lost — loading saved results from database...'
+            s.finish()
+            this.loadLastResults(true, syngenta)
           }
         }
-        else if (msg.type === 'campaign_linked') {
-          const match = s.result.district_health.find(
-            h => h.district === msg.district && h.state === msg.state
-          )
-          if (match) match.campaign_id = msg.campaign_id
-        }
-        else if (msg.type === 'complete') {
-          s.result.campaigns_created = msg.summary.campaigns_created
-          const skipped = msg.summary.skipped_unchanged || msg.summary.skipped_cached || 0
-          let label = `✅ Complete — ${msg.summary.total} districts`
-          if (skipped > 0) label += ` (${skipped} unchanged — no duplicates)`
-          s.phase = label
+
+        await poll()
+        s._pollTimer = setInterval(poll, 1500)
+      } catch (e) {
+        console.error(e)
+        s.phase = '❌ Failed to start pipeline'
+        s.finish()
+      }
+    },
+    runPipelineSSE(syngentaMode) {
+      const s = this.store
+      let url = `${API}/campaign/stream?limit=1000`
+      if (this.selectedState) url += `&state=${encodeURIComponent(this.selectedState)}`
+      if (syngentaMode) url += '&syngenta_only=true'
+
+      const source = new EventSource(url)
+      s._source = source
+
+      source.onmessage = (event) => {
+        const msg = JSON.parse(event.data)
+        const outcome = this.handlePipelineEvent(msg)
+        if (outcome === 'error') {
+          s.finish()
+        } else if (outcome === 'complete') {
           s.finish()
           this.fetchStats()
           this.fetchCampaigns()
           this.loadLastResults(true, s.result.mode === 'syngenta_real')
         }
       }
-      
+
       source.onerror = () => {
         s.phase = '❌ Connection lost — loading saved results from database...'
         s.finish()

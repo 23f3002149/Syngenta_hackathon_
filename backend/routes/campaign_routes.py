@@ -1,7 +1,8 @@
 # KrishiConnect AI - Campaign API Routes
+import json
+import time
 from flask import Blueprint, jsonify, request, Response
 from services.campaign_service import CampaignService
-import json
 
 campaign_bp = Blueprint('campaign', __name__)
 campaign_service = CampaignService()
@@ -28,6 +29,34 @@ def run_pipeline():
     return jsonify(result)
 
 
+@campaign_bp.route('/api/campaign/start-async', methods=['POST'])
+def start_pipeline_async():
+    """
+    Start pipeline in background (survives proxy timeouts).
+    Poll GET /api/campaign/job/<job_id>?since=N for progress.
+    """
+    data = request.json or {}
+    result = campaign_service.start_pipeline_job(
+        season=data.get('season'),
+        state=data.get('state'),
+        limit=data.get('limit', 1000),
+        syngenta_only=bool(data.get('syngenta_only', False)),
+    )
+    if result.get('error'):
+        return jsonify(result), 409
+    return jsonify(result)
+
+
+@campaign_bp.route('/api/campaign/job/<job_id>', methods=['GET'])
+def get_pipeline_job(job_id):
+    """Poll async pipeline job — pass since=event count from last response."""
+    since = request.args.get('since', 0, type=int)
+    result = campaign_service.get_pipeline_job(job_id, since=since)
+    if not result:
+        return jsonify({'error': 'Job not found'}), 404
+    return jsonify(result)
+
+
 @campaign_bp.route('/api/campaign/stream', methods=['GET'])
 def stream_pipeline():
     """
@@ -39,16 +68,24 @@ def stream_pipeline():
     syngenta_only = request.args.get('syngenta_only', 'false').lower() == 'true'
     
     def generate():
+        last_ping = time.time()
+        ping_interval = 12
         for event in campaign_service.run_pipeline_stream(
             state=state, limit=limit, syngenta_only=syngenta_only
         ):
+            now = time.time()
+            while now - last_ping >= ping_interval:
+                yield ": keepalive\n\n"
+                last_ping += ping_interval
             yield f"data: {json.dumps(event)}\n\n"
+            last_ping = time.time()
     
     return Response(
         generate(),
         content_type='text/event-stream',
         headers={
             'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
             'X-Accel-Buffering': 'no',
             'Access-Control-Allow-Origin': '*',
         }

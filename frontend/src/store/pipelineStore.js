@@ -14,8 +14,9 @@ export const pipelineStore = reactive({
   result: null,
   expandedStates: {},
   
-  // EventSource reference
+  // EventSource (local dev fallback) or poll timer (deploy)
   _source: null,
+  _pollTimer: null,
   
   // Reset for new run
   startRun() {
@@ -44,6 +45,10 @@ export const pipelineStore = reactive({
       this._source.close()
       this._source = null
     }
+    if (this._pollTimer) {
+      clearInterval(this._pollTimer)
+      this._pollTimer = null
+    }
   },
   
   // Clear all data (used after admin reset)
@@ -58,6 +63,10 @@ export const pipelineStore = reactive({
     if (this._source) {
       this._source.close()
       this._source = null
+    }
+    if (this._pollTimer) {
+      clearInterval(this._pollTimer)
+      this._pollTimer = null
     }
   },
   

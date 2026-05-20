@@ -4,7 +4,7 @@ services:
     env: python
     rootDir: backend
     buildCommand: bash render-build.sh
-    startCommand: gunicorn app:app
+    startCommand: gunicorn app:app -c gunicorn.conf.py
     envVars:
       - key: GEMINI_API_KEY
         sync: false

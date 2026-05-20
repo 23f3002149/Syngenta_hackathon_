@@ -16,6 +16,9 @@ class CampaignService:
     
     _pipeline_lock = threading.Lock()
     _pipeline_running = False
+    _pipeline_jobs = {}
+    _jobs_lock = threading.Lock()
+    _MAX_PIPELINE_JOBS = 30
     
     def __init__(self):
         self.content_service = ContentService()
@@ -25,6 +28,76 @@ class CampaignService:
     
     def is_pipeline_running(self):
         return CampaignService._pipeline_running
+    
+    def start_pipeline_job(self, season=None, state=None, limit=1000, syngenta_only=False):
+        """Start pipeline in a background thread; poll via get_pipeline_job()."""
+        if CampaignService._pipeline_running:
+            return {'error': 'Pipeline already running! Please wait.'}
+        
+        job_id = str(uuid.uuid4())[:12]
+        with CampaignService._jobs_lock:
+            CampaignService._prune_old_jobs()
+            CampaignService._pipeline_jobs[job_id] = {
+                'status': 'running',
+                'events': [],
+                'error': None,
+                'created_at': datetime.now().isoformat(),
+            }
+        
+        service = self
+        
+        def worker():
+            try:
+                for event in service.run_pipeline_stream(
+                    season=season, state=state, limit=limit, syngenta_only=syngenta_only
+                ):
+                    with CampaignService._jobs_lock:
+                        job = CampaignService._pipeline_jobs.get(job_id)
+                        if not job:
+                            return
+                        job['events'].append(event)
+                        if event.get('type') == 'complete':
+                            job['status'] = 'complete'
+                        elif event.get('type') == 'error':
+                            job['status'] = 'error'
+                            job['error'] = event.get('message', 'Pipeline error')
+            except Exception as e:
+                with CampaignService._jobs_lock:
+                    job = CampaignService._pipeline_jobs.get(job_id)
+                    if job:
+                        job['status'] = 'error'
+                        job['error'] = str(e)
+        
+        threading.Thread(target=worker, daemon=True).start()
+        return {'job_id': job_id, 'status': 'running'}
+    
+    @classmethod
+    def _prune_old_jobs(cls):
+        """Drop oldest finished jobs when over capacity."""
+        if len(cls._pipeline_jobs) <= cls._MAX_PIPELINE_JOBS:
+            return
+        finished = [
+            (jid, j) for jid, j in cls._pipeline_jobs.items()
+            if j.get('status') in ('complete', 'error')
+        ]
+        finished.sort(key=lambda x: x[1].get('created_at', ''))
+        for jid, _ in finished[: max(0, len(cls._pipeline_jobs) - cls._MAX_PIPELINE_JOBS)]:
+            cls._pipeline_jobs.pop(jid, None)
+    
+    def get_pipeline_job(self, job_id, since=0):
+        """Return new events since index `since` and job status."""
+        with CampaignService._jobs_lock:
+            job = CampaignService._pipeline_jobs.get(job_id)
+            if not job:
+                return None
+            events = job['events'][since:]
+            return {
+                'job_id': job_id,
+                'status': job['status'],
+                'events': events,
+                'next_since': len(job['events']),
+                'error': job.get('error'),
+            }
     
     def run_pipeline(self, season=None, state=None, limit=1000, use_simulated_weather=False):
         """

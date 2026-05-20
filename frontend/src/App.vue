@@ -1,4 +1,4 @@
-<template>
+![1779287650043](image/App/1779287650043.png)<template>
   <!-- Login/Register — no sidebar -->
   <router-view v-if="$route.meta.noLayout" />
 
